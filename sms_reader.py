@@ -1,217 +1,202 @@
 #!/usr/bin/env python3
 """
-SMS Reader CLI - Reads incoming and last 3 SMS messages from a connected phone/GSM modem.
-Communicates via AT commands over serial (USB) connection.
+SMS Reader CLI (ADB version) - Reads SMS messages from an Android phone via ADB.
+No special drivers needed — just USB Debugging enabled.
 
 Requirements:
-    pip install pyserial
+    - ADB installed and in PATH  (https://developer.android.com/tools/releases/platform-tools)
+    - USB Debugging enabled on your Android phone
+    - Phone connected via USB and authorized (accept the "Allow USB Debugging" prompt)
 
 Usage:
-    python sms_reader.py                  # Auto-detect port
-    python sms_reader.py --port COM3      # Windows
-    python sms_reader.py --port /dev/ttyUSB0  # Linux/macOS
+    python sms_reader.py                  # Show last 3 SMS messages
+    python sms_reader.py --last 10        # Show last 10 messages
     python sms_reader.py --monitor        # Monitor for new messages in real-time
+    python sms_reader.py --device <id>    # Target a specific device (if multiple connected)
 """
 
-import serial
-import serial.tools.list_ports
+import subprocess
+import json
 import time
-import re
 import argparse
 import sys
+import re
 from datetime import datetime
 
 
-# ── AT command helpers ────────────────────────────────────────────────────────
+# ── ADB helpers ───────────────────────────────────────────────────────────────
 
-def send_at(ser: serial.Serial, command: str, timeout: float = 2.0) -> str:
-    """Send an AT command and return the response."""
-    ser.write((command + "\r").encode())
-    time.sleep(0.3)
-    deadline = time.time() + timeout
-    response = ""
-    while time.time() < deadline:
-        if ser.in_waiting:
-            chunk = ser.read(ser.in_waiting).decode(errors="replace")
-            response += chunk
-            # Stop when we get a final result code
-            if re.search(r"\r\n(OK|ERROR|\+CMS ERROR|\+CME ERROR)[^\n]*\r\n", response):
-                break
-        time.sleep(0.05)
-    return response.strip()
+def run_adb(args: list[str], device_id: str = None) -> tuple[str, str, int]:
+    """Run an adb command. Returns (stdout, stderr, returncode)."""
+    cmd = ["adb"]
+    if device_id:
+        cmd += ["-s", device_id]
+    cmd += args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-def init_modem(ser: serial.Serial) -> bool:
-    """Initialize modem – returns True on success."""
-    checks = [
-        ("AT", "OK"),           # Basic check
-        ("AT+CMGF=1", "OK"),    # Text mode for SMS
-        ("AT+CSCS=\"GSM\"", "OK"),  # GSM character set
-    ]
-    for cmd, expected in checks:
-        resp = send_at(ser, cmd)
-        if expected not in resp:
-            print(f"  [!] Command '{cmd}' failed. Response: {resp!r}")
-            return False
-    return True
+def check_adb_installed() -> bool:
+    _, _, code = run_adb(["version"])
+    return code == 0
 
 
-# ── SIM / device info ─────────────────────────────────────────────────────────
-
-def get_sim_number(ser: serial.Serial) -> str:
-    """Try to retrieve the SIM card's own phone number."""
-    # CNUM is the standard command; not all modems support it
-    resp = send_at(ser, "AT+CNUM", timeout=3)
-    match = re.search(r'\+CNUM:\s*"[^"]*","(\+?[\d]+)"', resp)
-    if match:
-        return match.group(1)
-
-    # Fallback: try reading from EF_MSISDN via +CPBS
-    resp2 = send_at(ser, 'AT+CPBS="ON"')
-    if "OK" in resp2:
-        resp3 = send_at(ser, "AT+CPBR=1")
-        m = re.search(r'\+CPBR:\d+,"(\+?[\d]+)"', resp3)
-        if m:
-            return m.group(1)
-
-    return "Unknown (not reported by modem)"
+def get_connected_devices() -> list[dict]:
+    stdout, _, _ = run_adb(["devices", "-l"])
+    devices = []
+    for line in stdout.splitlines()[1:]:
+        if not line.strip() or "offline" in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            dev = {"id": parts[0]}
+            for part in parts[2:]:
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    dev[k] = v
+            devices.append(dev)
+    return devices
 
 
-def get_imsi(ser: serial.Serial) -> str:
-    """Get IMSI – identifies the SIM card uniquely."""
-    resp = send_at(ser, "AT+CIMI", timeout=3)
-    match = re.search(r"(\d{10,20})", resp)
-    return match.group(1) if match else "Unknown"
+def check_device_authorized(device_id: str) -> bool:
+    stdout, _, _ = run_adb(["devices"], device_id)
+    return "unauthorized" not in stdout
 
 
-def get_operator(ser: serial.Serial) -> str:
-    resp = send_at(ser, "AT+COPS?")
-    match = re.search(r'\+COPS:\d,\d,"([^"]+)"', resp)
-    return match.group(1) if match else "Unknown"
+# ── SIM info ──────────────────────────────────────────────────────────────────
+
+def get_sim_info(device_id: str) -> dict:
+    """Get SIM card number, operator, IMEI via ADB shell commands."""
+    info = {}
+
+    # Phone number (requires READ_PHONE_STATE — may return 'null' on some ROMs)
+    out, _, _ = run_adb(["shell", "service call iphonesubinfo 15 | grep -o '\"[^\"]*\"' | tr -d '\"'"], device_id)
+    number = out.strip().replace(".", "").strip()
+    info["sim_number"] = number if number and number not in ("null", "") else "Unknown (hidden by ROM)"
+
+    # Try getprop as fallback
+    if info["sim_number"].startswith("Unknown"):
+        out2, _, _ = run_adb(["shell", "getprop", "net.rmnet0.local-ip"], device_id)
+        out3, _, _ = run_adb(["shell", "getprop", "gsm.sim.operator.alpha"], device_id)
+        info["operator"] = out3.strip() or "Unknown"
+    else:
+        out3, _, _ = run_adb(["shell", "getprop", "gsm.sim.operator.alpha"], device_id)
+        info["operator"] = out3.strip() or "Unknown"
+
+    # IMEI
+    out4, _, _ = run_adb(["shell", "service call iphonesubinfo 1 | grep -o '\"[^\"]*\"' | tr -d '\"\\n. '"], device_id)
+    info["imei"] = out4.strip() or "Unknown"
+
+    # IMSI via telephony db (needs root) — try anyway
+    out5, _, _ = run_adb(["shell", "settings get secure android_id"], device_id)
+    info["android_id"] = out5.strip() or "Unknown"
+
+    return info
 
 
-# ── SMS parsing ───────────────────────────────────────────────────────────────
+# ── SMS reading ───────────────────────────────────────────────────────────────
 
-def parse_sms_list(raw: str) -> list[dict]:
+def read_sms(device_id: str, limit: int = 3) -> list[dict]:
     """
-    Parse the raw output of AT+CMGL or AT+CMGR into a list of message dicts.
-    Handles both +CMGL and +CMGR response formats.
+    Read SMS messages from the Android content provider.
+    Queries content://sms — no root needed.
     """
-    messages = []
-    # Pattern: +CMGL: index,"status","sender",,"timestamp"\r\nbody
-    pattern = re.compile(
-        r'\+CMG[LR]:\s*(\d+)?,?"([^"]*)",\s*"([^"]*)"(?:,\s*"([^"]*)")?\r?\n(.*?)(?=\r?\n\+CMG|\r?\n\r?\nOK|$)',
-        re.DOTALL
+    # Columns: _id, address (sender), date, body, type (1=inbox,2=sent), read
+    query = (
+        f"content query --uri content://sms/inbox "
+        f"--projection _id,address,date,body,read "
+        f"--sort 'date DESC' "
+        f"--limit {limit} --limit {limit}"
     )
-    for m in pattern.finditer(raw):
-        index   = m.group(1) or "?"
-        status  = m.group(2)
-        sender  = m.group(3)
-        ts      = m.group(4) or ""
-        body    = m.group(5).strip().replace("\r", "")
-        messages.append({
-            "index":     index,
-            "status":    status,
-            "sender":    sender,
-            "timestamp": ts,
-            "body":      body,
-        })
-    return messages
+
+    # ADB content query command
+    out, err, code = run_adb([
+        "shell", "content", "query",
+        "--uri", "content://sms/inbox",
+        "--projection", "_id:address:date:body:read",
+        "--sort", "date DESC",
+    ], device_id)
+
+    if code != 0 or not out:
+        return []
+
+    messages = []
+    # Each row starts with "Row: N"
+    rows = re.split(r'Row:\s*\d+\s*', out)
+    for row in rows:
+        if not row.strip():
+            continue
+        msg = {}
+        for field in ["_id", "address", "date", "body", "read"]:
+            m = re.search(rf'{field}=([^\,]+?)(?:,\s*\w+=|$)', row, re.DOTALL)
+            if m:
+                msg[field] = m.group(1).strip()
+        if msg:
+            # Convert epoch ms to readable timestamp
+            if "date" in msg:
+                try:
+                    ts = int(msg["date"]) / 1000
+                    msg["date_human"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    msg["date_human"] = msg.get("date", "")
+            messages.append(msg)
+
+    return messages[:limit]
 
 
-def read_all_sms(ser: serial.Serial) -> list[dict]:
-    """Read ALL stored SMS messages from the modem."""
-    resp = send_at(ser, 'AT+CMGL="ALL"', timeout=10)
-    return parse_sms_list(resp)
+# ── Display ───────────────────────────────────────────────────────────────────
 
-
-def read_last_n_sms(ser: serial.Serial, n: int = 3) -> list[dict]:
-    """Return the last N SMS messages (by storage index)."""
-    all_msgs = read_all_sms(ser)
-    return all_msgs[-n:] if len(all_msgs) >= n else all_msgs
-
-
-# ── Display helpers ───────────────────────────────────────────────────────────
-
-SEPARATOR = "─" * 60
+SEP = "─" * 60
 
 def print_banner():
     print("\n" + "═" * 60)
-    print("  📱  SMS Reader CLI")
+    print("  📱  SMS Reader CLI  [ADB Mode]")
     print("═" * 60)
 
 
-def print_sim_info(sim_number: str, imsi: str, operator: str):
-    print(f"\n{'SIM Info':}")
-    print(SEPARATOR)
-    print(f"  SIM Number  : {sim_number}")
-    print(f"  IMSI        : {imsi}")
-    print(f"  Operator    : {operator}")
-    print(SEPARATOR)
+def print_sim_info(info: dict):
+    print(f"\nSIM / Device Info")
+    print(SEP)
+    print(f"  SIM Number  : {info.get('sim_number', 'Unknown')}")
+    print(f"  Operator    : {info.get('operator', 'Unknown')}")
+    print(f"  IMEI        : {info.get('imei', 'Unknown')}")
+    print(f"  Android ID  : {info.get('android_id', 'Unknown')}")
+    print(SEP)
 
 
 def print_message(msg: dict, sim_number: str, label: str = "SMS"):
+    read_status = "Read" if msg.get("read") == "1" else "Unread"
     print(f"\n[{label}]")
-    print(SEPARATOR)
-    print(f"  Index       : {msg['index']}")
-    print(f"  Status      : {msg['status']}")
-    print(f"  From        : {msg['sender']}")
+    print(SEP)
+    print(f"  ID          : {msg.get('_id', '?')}")
+    print(f"  Status      : {read_status}")
+    print(f"  From        : {msg.get('address', 'Unknown')}")
     print(f"  SIM Number  : {sim_number}")
-    if msg['timestamp']:
-        print(f"  Timestamp   : {msg['timestamp']}")
+    print(f"  Received    : {msg.get('date_human', msg.get('date', '?'))}")
     print(f"  Message     :")
-    for line in msg['body'].splitlines():
-        print(f"              {line}")
-    print(SEPARATOR)
-
-
-# ── Port detection ────────────────────────────────────────────────────────────
-
-KNOWN_MODEM_VIDS = {0x12D1, 0x19D2, 0x1E0E, 0x1A86, 0x067B, 0x0403, 0x04E2}
-
-def detect_modem_port() -> str | None:
-    """Try to auto-detect a GSM modem / phone serial port."""
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        return None
-
-    # Prefer ports that look like modems
-    for p in ports:
-        vid = p.vid or 0
-        desc = (p.description or "").lower()
-        if vid in KNOWN_MODEM_VIDS or any(k in desc for k in ("modem", "gsm", "huawei", "zte", "sierra", "option", "wwan")):
-            return p.device
-
-    # Last resort – return first available port
-    return ports[0].device
-
-
-def list_ports():
-    print("\nAvailable serial ports:")
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        print("  (none found)")
-    for p in ports:
-        print(f"  {p.device:20s}  {p.description}")
+    body = msg.get("body", "").strip()
+    for line in body.splitlines():
+        print(f"    {line}")
+    print(SEP)
 
 
 # ── Monitor mode ──────────────────────────────────────────────────────────────
 
-def monitor_new_sms(ser: serial.Serial, sim_number: str, poll_interval: float = 3.0):
-    """Poll for new (UNREAD) messages continuously."""
+def monitor_sms(device_id: str, sim_number: str, poll_interval: float = 4.0):
     print(f"\n📡  Monitoring for new SMS messages (Ctrl+C to stop)...\n")
-    seen_indices = set()
+    seen_ids = set()
 
-    # Seed with already-read messages so we don't re-display them
-    for msg in read_all_sms(ser):
-        seen_indices.add(msg["index"])
+    # Seed with existing messages
+    for msg in read_sms(device_id, limit=50):
+        seen_ids.add(msg.get("_id"))
 
     try:
         while True:
-            msgs = read_all_sms(ser)
+            msgs = read_sms(device_id, limit=20)
             for msg in msgs:
-                if msg["index"] not in seen_indices:
-                    seen_indices.add(msg["index"])
+                mid = msg.get("_id")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
                     print(f"\n🔔  New message at {datetime.now().strftime('%H:%M:%S')}")
                     print_message(msg, sim_number, label="NEW SMS")
             time.sleep(poll_interval)
@@ -219,74 +204,103 @@ def monitor_new_sms(ser: serial.Serial, sim_number: str, poll_interval: float = 
         print("\n\nMonitoring stopped.")
 
 
+# ── Setup instructions ────────────────────────────────────────────────────────
+
+def print_setup_guide():
+    print("""
+┌─────────────────────────────────────────────────────────┐
+│              SETUP: Enable USB Debugging                │
+├─────────────────────────────────────────────────────────┤
+│  1. On your Android phone:                              │
+│     Settings → About Phone → tap Build Number 7 times  │
+│     (unlocks Developer Options)                         │
+│                                                         │
+│  2. Settings → Developer Options → Enable USB Debugging │
+│                                                         │
+│  3. Plug in your phone via USB                          │
+│     Accept the "Allow USB Debugging?" prompt on phone   │
+│                                                         │
+│  4. Install ADB if not already:                         │
+│     https://developer.android.com/tools/releases/       │
+│     platform-tools                                      │
+│     (add to PATH so 'adb' works in terminal)            │
+│                                                         │
+│  5. Verify with: adb devices                            │
+│     Your device should show as "device" (not            │
+│     "unauthorized")                                     │
+└─────────────────────────────────────────────────────────┘
+""")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Read SMS messages from a phone/GSM modem connected via USB."
+        description="Read SMS messages from an Android phone via ADB."
     )
-    parser.add_argument("--port",    help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
-    parser.add_argument("--baud",    type=int, default=115200, help="Baud rate (default 115200)")
-    parser.add_argument("--last",    type=int, default=3,      help="Number of last messages to show (default 3)")
-    parser.add_argument("--monitor", action="store_true",      help="Monitor for new incoming SMS in real-time")
-    parser.add_argument("--list-ports", action="store_true",   help="List available serial ports and exit")
+    parser.add_argument("--last",    type=int, default=3,  help="Number of recent messages to show (default: 3)")
+    parser.add_argument("--monitor", action="store_true",  help="Monitor for new incoming SMS in real-time")
+    parser.add_argument("--device",  help="ADB device ID (use if multiple devices connected)")
+    parser.add_argument("--setup",   action="store_true",  help="Show setup instructions")
     args = parser.parse_args()
 
-    if args.list_ports:
-        list_ports()
+    if args.setup:
+        print_setup_guide()
         sys.exit(0)
 
     print_banner()
 
-    # Resolve port
-    port = args.port
-    if not port:
-        print("\n🔍  Auto-detecting modem port...")
-        port = detect_modem_port()
-        if not port:
-            print("  [!] No serial port found. Connect your phone/modem and try again.")
-            print("      Or specify a port with --port <PORT>")
-            list_ports()
-            sys.exit(1)
-        print(f"  Found: {port}")
+    # Check ADB is installed
+    print("\n🔍  Checking ADB...")
+    if not check_adb_installed():
+        print("  [!] 'adb' not found. Please install Android Platform Tools.")
+        print("      https://developer.android.com/tools/releases/platform-tools")
+        print("\n  Run with --setup for full instructions.")
+        sys.exit(1)
+    print("  ✓  ADB found.")
 
-    # Open serial connection
-    print(f"\n🔌  Connecting to {port} at {args.baud} baud...")
-    try:
-        ser = serial.Serial(port, baudrate=args.baud, timeout=2)
-    except serial.SerialException as e:
-        print(f"  [!] Could not open port: {e}")
+    # Check connected devices
+    print("\n🔌  Looking for connected Android devices...")
+    devices = get_connected_devices()
+
+    if not devices:
+        print("  [!] No authorized Android device found.")
+        print("\n  Make sure:")
+        print("    • USB Debugging is enabled on your phone")
+        print("    • You accepted the 'Allow USB Debugging' prompt on your phone")
+        print("    • Your phone is connected via USB")
+        print("\n  Run with --setup for full instructions.")
         sys.exit(1)
 
-    time.sleep(1)  # Let port settle
+    # Pick device
+    device_id = args.device
+    if not device_id:
+        if len(devices) > 1:
+            print(f"\n  Multiple devices found:")
+            for i, d in enumerate(devices):
+                print(f"    [{i}] {d['id']}  model={d.get('model', '?')}")
+            print(f"\n  Using first device. Use --device <id> to select another.")
+        device_id = devices[0]["id"]
 
-    # Init modem
-    print("⚙️   Initializing modem...")
-    if not init_modem(ser):
-        print("  [!] Modem initialization failed. Check connection and try again.")
-        ser.close()
-        sys.exit(1)
-    print("  ✓  Modem ready.")
+    model = devices[0].get("model", "Android Device")
+    print(f"  ✓  Connected: {model} ({device_id})")
 
-    # Gather SIM info
+    # Get SIM info
     print("\n📋  Fetching SIM info...")
-    sim_number = get_sim_number(ser)
-    imsi       = get_imsi(ser)
-    operator   = get_operator(ser)
-    print_sim_info(sim_number, imsi, operator)
+    sim_info = get_sim_info(device_id)
+    print_sim_info(sim_info)
+    sim_number = sim_info.get("sim_number", "Unknown")
 
     if args.monitor:
-        monitor_new_sms(ser, sim_number)
+        monitor_sms(device_id, sim_number)
     else:
-        # Show last N messages
-        print(f"\n📨  Last {args.last} SMS message(s):\n")
-        msgs = read_last_n_sms(ser, args.last)
+        print(f"\n📨  Last {args.last} SMS message(s) (Inbox):\n")
+        msgs = read_sms(device_id, limit=args.last)
         if not msgs:
-            print("  (No messages found in storage)")
+            print("  (No messages found — inbox may be empty or permission denied)")
         for msg in msgs:
             print_message(msg, sim_number)
 
-    ser.close()
     print("\nDone.\n")
 
 
