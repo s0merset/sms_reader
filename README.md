@@ -32,11 +32,13 @@ Before using this tool, ensure you have the following set up:
 1. (Optional for Linux/macOS) Make the script executable:
     ```bash 
     chmod +x sms_reader.py
+    ```
 
 ## 💻 Usage
 Run the script from your terminal. If you run it without any arguments, it will default to showing your last 3 SMS conversations.
     ```bash
     python sms_reader.py
+    ```
 
 ## 🛠️ Available Commands & Options
 Option	Description	Example
