@@ -21,7 +21,7 @@ Before using this tool, ensure you have the following set up:
 3. **USB Debugging** or **Wireless Debugging** enabled on your Android device (found in Developer Options).
 4. Your computer must be **authorized** on your Android device (accept the prompt on your phone screen when you connect it for the first time).
 
-## 🚀 Installation
+# 🚀 Installation
 
 1. Clone or download the script to your local machine (e.g., `sms_reader.py`).
 2. Install the required Python library (`click`):
@@ -29,25 +29,25 @@ Before using this tool, ensure you have the following set up:
    ```bash
    pip install click sms_reader
 
-1. (Optional for Linux/macOS) Make the script executable:
+3. (Optional for Linux/macOS) Make the script executable:
     ```bash 
     chmod +x sms_reader.py
-    ```
 
-## 💻 Usage
+
+💻 Usage
 Run the script from your terminal. If you run it without any arguments, it will default to showing your last 3 SMS conversations.
     ```bash
     python sms_reader.py
-    ```
 
 ## 🛠️ Available Commands & Options
-Option	Description	Example
---last <int>	Specify the number of messages/conversations to display (Default is 3).	python sms_reader.py --last 5
---monitor	Run continuously and watch for new incoming SMS messages in real-time.	python sms_reader.py --monitor
---all	Show all recent messages sequentially, rather than grouping them by unique senders/conversations.	python sms_reader.py --all --last 10
---senders	Print a clean list of all unique contacts/numbers that have ever texted you.	python sms_reader.py --senders
---device <id>	Target a specific device if multiple phones/emulators are connected via ADB.	python sms_reader.py --device 192.168.1.10:5555
---debug	Print raw ADB queries and output for troubleshooting.	python sms_reader.py --debug
---help	Show the help menu with all available commands.	python sms_reader.py --help
+| Option          | Description                                                                                       | Example                                           |
+| --------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `--last <int>`  | Specify the number of messages/conversations to display (Default is 3).                           | `python sms_reader.py --last 5`                   |
+| `--monitor`     | Run continuously and watch for new incoming SMS messages in real-time.                            | `python sms_reader.py --monitor`                  |
+| `--all`         | Show all recent messages sequentially, rather than grouping them by unique senders/conversations. | `python sms_reader.py --all --last 10`            |
+| `--senders`     | Print a clean list of all unique contacts/numbers that have ever texted you.                      | `python sms_reader.py --senders`                  |
+| `--device <id>` | Target a specific device if multiple phones/emulators are connected via ADB.                      | `python sms_reader.py --device 192.168.1.10:5555` |
+| `--debug`       | Print raw ADB queries and output for troubleshooting.                                             | `python sms_reader.py --debug`                    |
+| `--help`        | Show the help menu with all available commands.                                                   | `python sms_reader.py --help`                     |
 
 
