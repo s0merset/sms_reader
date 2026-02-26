@@ -1,4 +1,4 @@
-## 📱 Android ADB SMS Reader & Monitor
+## 📱 Android SMS Reader & Monitor
 
 A lightweight, Python-based Command Line Interface (CLI) tool that lets you read, manage, and monitor SMS messages on your Android device directly from your computer terminal using ADB (Android Debug Bridge).
 
